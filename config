@@ -1,0 +1,21 @@
+# /var/git/nginx-rtsp-addon/config
+# no file-extension, no CRLF, just plain LF lines
+
+# the internal name of your addon
+ngx_addon_name=ngx_rtsp_module
+
+# tell nginx this is a CORE‐level module
+ngx_module_type=CORE
+
+# list of C sources to compile into the nginx binary
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
+                $ngx_addon_dir/ngx_rtsp_module.c \
+                $ngx_addon_dir/ngx_rtsp_handler.c"
+
+# Add these lines for event module dependency
+ngx_module_deps="src/event/ngx_event.h \
+                 src/event/ngx_event_timer.h"
+
+# add your addon dir to the compiler include‐paths
+# (so that #include "ngx_rtsp_module.h" in the RTMP code will resolve)
+ngx_addon_incs="$ngx_addon_incs -I $ngx_addon_dir"
