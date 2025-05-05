@@ -1,9 +1,12 @@
 // ngx_rtsp_handler.c
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include "ngx_rtsp_module.h"
 #include <ngx_event.h>        // For ngx_add_timer()
 #include <ngx_event_posted.h> // For event handling primitives
+#include <string.h>
 
 // shared NALU pool (one per mountpoint)
 typedef struct {
@@ -232,30 +235,20 @@ parse_content_length(u_char *data, size_t len)
     }
     return -1;
 }
-/*
+
 static ngx_int_t
 read_exact(ngx_connection_t *c, u_char *buf, size_t len)
 {
-    ssize_t total = 0;
-    ssize_t n;
-
-    while (total < (ssize_t)len) {
+    ssize_t  total = 0, n;
+    while ((size_t) total < len) {
         n = c->recv(c, buf + total, len - total);
-        
-        if (n == 0) {
+        if (n <= 0) {
             return NGX_ERROR;
         }
-        
-        if (n == NGX_ERROR) {
-            return NGX_ERROR;
-        }
-        
         total += n;
     }
-
     return NGX_OK;
 }
-*/
 
 static void
 ngx_rtsp_send_simple_response(ngx_connection_t *c,
@@ -447,176 +440,106 @@ ngx_rtsp_handle_announce(ngx_connection_t *c, int cseq, u_char *raw, ssize_t raw
 {
     ngx_rtsp_session_t *rs = c->data;
     u_char             *hdr_end, *body_start;
-    size_t              header_len, got_in_buf;
+    size_t              header_len, got_in_buf, to_read;
     ssize_t             clen;
     u_char             *sdp_buf;
-    char               *line_end, *line, *method, *uri;
-    ngx_str_t           mount;
+    char               *hdr_end_c;
 
-    /* 1. Parse Request-Line */
-    line_end = strstr((char*)raw, "\r\n");
-    if (!line_end) {
+    /* 1) find end of headers: "\r\n\r\n" */
+    hdr_end_c = strstr((char*) raw, "\r\n\r\n");
+    if (hdr_end_c == NULL) {
         ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
         return;
     }
+    hdr_end     = (u_char*) hdr_end_c;
+    body_start  = hdr_end + 4;
+    header_len  = body_start - raw;
+    got_in_buf  = raw_len     - header_len;
 
-    /* Copy first line to temporary buffer */
-    size_t line_len = line_end - (char*)raw;
-    char *line_copy = ngx_palloc(c->pool, line_len + 1);
-    if (!line_copy) {
-        ngx_rtsp_send_simple_response(c, cseq, 500, "Internal Error", NULL);
-        return;
-    }
-    ngx_memcpy(line_copy, raw, line_len);
-    line_copy[line_len] = '\0';
-
-    /* Parse method and URI */
-    line = line_copy;
-    method = strsep(&line, " ");
-    uri = strsep(&line, " ");
-    if (!method || !uri) {
+    if (!hdr_end) {
         ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
         return;
     }
-
-    /* NEW: Parse full RTSP URI into just path */
-    char *path_start = strstr(uri, "://");
-    if (path_start) {
-        path_start = strchr(path_start + 3, '/');
-        if (!path_start) {
-            ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
-            return;
-        }
-        uri = path_start;
-    }
-
-    /* Validate path */
-    if (uri[0] != '/') {
-        ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
-        return;
-    }
-    mount.data = (u_char*)(uri + 1);
-    mount.len = strlen((char*)mount.data);
-
-    /* 3. Find end of headers */
-    char *hdr_end_c = strstr((char*)raw, "\r\n\r\n");
-    if (!hdr_end_c) {
-        ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
-        return;
-    }
-
-    hdr_end = (u_char*)hdr_end_c;
     body_start = hdr_end + 4;
     header_len = body_start - raw;
     got_in_buf = raw_len - header_len;
 
-    /* 4. Parse Content-Length */
+    // 2) parse Content-Length
     clen = parse_content_length(raw, header_len);
     if (clen <= 0) {
         ngx_rtsp_send_simple_response(c, cseq, 411, "Length Required", NULL);
         return;
     }
 
-    /* 5. Read SDP body */
+    // 3) allocate full buffer
     sdp_buf = ngx_palloc(c->pool, clen + 1);
     if (!sdp_buf) {
-        ngx_rtsp_send_simple_response(c, cseq, 500, "Internal Error", NULL);
+        ngx_rtsp_send_simple_response(c, cseq, 500, "Internal Server Error", NULL);
         return;
     }
 
-    size_t total_read = 0;
+    // 4) copy the portion already in 'raw'
     if (got_in_buf > 0) {
-        size_t to_copy = (got_in_buf > (size_t)clen) ? (size_t)clen : got_in_buf;
-        ngx_memcpy(sdp_buf, body_start, to_copy);
-        total_read = to_copy;
+        if (got_in_buf > (size_t)clen) {
+            got_in_buf = clen;
+        }
+        ngx_memcpy(sdp_buf, body_start, got_in_buf);
     }
 
-    while (total_read < (size_t)clen) {
-        ssize_t n = c->recv(c, sdp_buf + total_read, clen - total_read);
-        if (n <= 0) {
+    // 5) read the *rest* from the socket
+    to_read = (size_t)clen - got_in_buf;
+    if (to_read) {
+        if (read_exact(c, sdp_buf + got_in_buf, to_read) != NGX_OK) {
             ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
             return;
         }
-        total_read += n;
     }
+
     sdp_buf[clen] = '\0';
     rs->remote_sdp = sdp_buf;
 
-    /* 6. Get/Create stream */
-    rs->stream = get_stream(c->pool, &mount);
-    if (!rs->stream) {
-        ngx_rtsp_send_simple_response(c, cseq, 500, "Internal Error", NULL);
-        return;
-    }
 
-    /* 7. Extract SPS/PPS */
-    ngx_rtsp_nalu_pool_t *pool = &rs->stream->pool;
-    char *fmtp = strstr((char*)sdp_buf, "sprop-parameter-sets=");
-    if (fmtp) {
-        fmtp += strlen("sprop-parameter-sets=");
-        char *comma = strchr(fmtp, ',');
-        if (!comma) {
-            ngx_log_error(NGX_LOG_ERR, c->log, 0, "Invalid sprop-parameter-sets");
-            ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
-            return;
-        }
-        *comma = '\0';
+    /* 7) extract SPS/PPS */
+    {
+        char *fmtp = strstr((char*) sdp_buf, "sprop-parameter-sets=");
+        if (fmtp) {
+            fmtp += strlen("sprop-parameter-sets=");
+            char *comma = strchr(fmtp, ',');
+            if (comma) {
+                *comma = '\0';
 
-        /* Decode SPS */
-        size_t b64len = strlen(fmtp);
-        pool->sps_len = ngx_base64_decoded_length(b64len);
-        pool->sps = ngx_palloc(c->pool, pool->sps_len);
-        if (!pool->sps) {
-            ngx_rtsp_send_simple_response(c, cseq, 500, "Internal Error", NULL);
-            return;
-        }
-        ngx_str_t src = { b64len, (u_char*)fmtp };
-        ngx_str_t dst = { pool->sps_len, pool->sps };
-        if (ngx_decode_base64(&dst, &src) != NGX_OK) {
-            ngx_rtsp_send_simple_response(c, cseq, 400, "Bad SPS", NULL);
-            return;
-        }
+                /* SPS */
+                size_t b64len = strlen(fmtp);
+                rs->stream->pool.sps_len = ngx_base64_decoded_length(b64len);
+                rs->stream->pool.sps     = ngx_palloc(c->pool, rs->stream->pool.sps_len);
+                {
+                    ngx_str_t src = { b64len, (u_char*)fmtp };
+                    ngx_str_t dst = { rs->stream->pool.sps_len, rs->stream->pool.sps };
+                    ngx_decode_base64(&dst, &src);
+                }
 
-        /* Decode PPS */
-        char *pps_b64 = comma + 1;
-        size_t b64len2 = strlen(pps_b64);
-        pool->pps_len = ngx_base64_decoded_length(b64len2);
-        pool->pps = ngx_palloc(c->pool, pool->pps_len);
-        if (!pool->pps) {
-            ngx_rtsp_send_simple_response(c, cseq, 500, "Internal Error", NULL);
-            return;
-        }
-        ngx_str_t src2 = { b64len2, (u_char*)pps_b64 };
-        ngx_str_t dst2 = { pool->pps_len, pool->pps };
-        if (ngx_decode_base64(&dst2, &src2) != NGX_OK) {
-            ngx_rtsp_send_simple_response(c, cseq, 400, "Bad PPS", NULL);
-            return;
+                /* PPS */
+                char *pps_b64 = comma + 1;
+                size_t b64len2 = strlen(pps_b64);
+                rs->stream->pool.pps_len = ngx_base64_decoded_length(b64len2);
+                rs->stream->pool.pps     = ngx_palloc(c->pool, rs->stream->pool.pps_len);
+                {
+                    ngx_str_t src2 = { b64len2, (u_char*)pps_b64 };
+                    ngx_str_t dst2 = { rs->stream->pool.pps_len, rs->stream->pool.pps };
+                    ngx_decode_base64(&dst2, &src2);
+                }
+            }
         }
     }
 
-    /* 8. Validate Profile-Level-ID */
-    char *profile_level = strstr((char*)sdp_buf, "profile-level-id=");
-    if (profile_level) {
-        profile_level += strlen("profile-level-id=");
-        char *end = strpbrk(profile_level, ";\r\n");
-        size_t len = end ? (size_t)(end - profile_level) : strlen(profile_level);
-        if (len != 6 || strncmp(profile_level, "4D4029", 6) != 0) {
-            ngx_rtsp_send_simple_response(c, cseq, 400, "Unsupported Profile", NULL);
-            return;
-        }
-    }
-
-    /* 9. Send response */
-    char extra[128];
-    ngx_snprintf((u_char*) extra, sizeof(extra), "Session: %d\r\nContent-Length: 0\r\n", rs->session_id);
-    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", extra);
-
-    /* Reset read handler */
-    c->read->handler = ngx_rtsp_recv;
+    /* 8) send 200 OK and re‐arm read */
+    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", NULL);
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         ngx_close_connection(c);
     }
+    return;
 }
+
 
 static void
 ngx_rtsp_handle_record(ngx_connection_t *c, int cseq, ngx_rtsp_session_t *rs)
@@ -640,19 +563,15 @@ ngx_rtsp_handle_record(ngx_connection_t *c, int cseq, ngx_rtsp_session_t *rs)
 // added function
 
 /* Reads raw RTSP request, logs it, and sends back a placeholder */
-static void
-ngx_rtsp_recv(ngx_event_t *rev)
+static void ngx_rtsp_recv(ngx_event_t *rev)
 {
-    ngx_connection_t   *c = rev->data;
+    ngx_connection_t   *c  = rev->data;
     ngx_rtsp_session_t *rs = c->data;
-    u_char              buf[4096];
-    u_char              raw[4096];
     ssize_t             n;
-    ssize_t             idx;
-
-    char               *method, *uri, *line;
+    u_char             *buf;
+    size_t              buf_size = 4096;
     int                 cseq = 0;
-
+    char               *method, *uri, *line;
 
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_ERR, c->log, 0, "RTSP: recv timeout");
@@ -660,36 +579,29 @@ ngx_rtsp_recv(ngx_event_t *rev)
         return;
     }
 
-    n = c->recv(c, buf, sizeof(buf) - 1);
+    buf = ngx_palloc(c->pool, buf_size);
+    if (buf == NULL) {
+        ngx_close_connection(c);
+        return;
+    }
+
+    n = c->recv(c, buf, buf_size - 1);
     if (n <= 0) {
         ngx_close_connection(c);
         return;
     }
 
+    buf[n] = '\0';
+
+    /* log raw request */
     ngx_log_error(NGX_LOG_ERR, c->log, 0,
-        "RAW REQUEST DUMP:\n%*s", (int)n, buf);
+                  "RAW REQUEST DUMP:\n%*s", (int)n, buf);
 
-
-    /* clamp + NULL */
+    /* extract CSeq */
     {
-        ssize_t max = (ssize_t)(sizeof(buf) - 1);
-        idx = n < max ? n : max;
-        buf[idx] = '\0';
-    }
-
-    /* copy exactly the valid portion (including the '\0') */
-    ngx_memcpy(raw, buf, idx + 1);
-
-    /* extract CSeq first */
-    {
-        char *hdr = strstr((char*)buf, "CSeq:");
-        if (hdr) {
-            char *colon = strchr(hdr, ':');
-            if (colon) {
-                char *v = colon + 1;
-                while (*v==' '||*v=='\t') v++;
-                cseq = atoi(v);
-            }
+        char *h = strstr((char*)buf, "CSeq:");
+        if (h) {
+            cseq = atoi(h + 5);
         }
     }
 
@@ -697,7 +609,8 @@ ngx_rtsp_recv(ngx_event_t *rev)
     line   = (char*) buf;
     method = strsep(&line, " ");
     uri    = strsep(&line, " ");
-    /* drop version */  strsep(&line, "\r\n");
+    /* drop RTSP version */
+    strsep(&line, "\r\n");
 
     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                   "RTSP: method='%s' uri='%s' CSeq=%d",
@@ -710,33 +623,77 @@ ngx_rtsp_recv(ngx_event_t *rev)
         ngx_rtsp_handle_describe(c, cseq, uri);
     }
     else if (strcmp(method, "SETUP") == 0) {
-        ngx_rtsp_handle_setup(c, cseq, (char *) raw, rs);
+        ngx_rtsp_handle_setup(c, cseq, (const char*) buf, rs);
     }
     else if (strcmp(method, "PLAY") == 0) {
-        ngx_rtsp_handle_play(c, cseq, (char *) raw, rs);
+        ngx_rtsp_handle_play(c, cseq, (const char*) buf, rs);
     }
     else if (strcmp(method, "ANNOUNCE") == 0) {
-        ngx_rtsp_handle_announce(c, cseq, raw, idx);
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+            "RTSP → ANNOUNCE, awaiting full SDP...");
+        
+        u_char  *hdr_end;
+        size_t   total = n, hdr_len;
+        ssize_t  content_len;
+    
+        // 1) keep reading until we see the end of the RTSP header ("\r\n\r\n")
+        hdr_end = ngx_strnstr(buf, "\r\n\r\n", total);
+        while (!hdr_end) {
+            ssize_t m = c->recv(c, buf + total, buf_size - 1 - total);
+            if (m <= 0) {
+                ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
+                return;
+            }
+            total += m;
+            buf[total] = '\0';
+            hdr_end = ngx_strnstr(buf, "\r\n\r\n", total);
+        }
+    
+        // 2) compute header length
+        hdr_len = (hdr_end + 4) - buf;
+    
+        // 3) parse Content-Length
+        content_len = parse_content_length(buf, hdr_len);
+        if (content_len <= 0) {
+            ngx_rtsp_send_simple_response(c, cseq, 411, "Length Required", NULL);
+            return;
+        }
+    
+        // 4) read exactly content_len SDP bytes
+        {
+            size_t got = total - hdr_len;
+            while ((ssize_t)got < content_len) {
+                ssize_t m = c->recv(c, buf + hdr_len + got, content_len - got);
+                if (m <= 0) {
+                    ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
+                    return;
+                }
+                got += m;
+            }
+        }
+    
+        // 5) hand the full buffer (headers + body) to your handler
+        ngx_rtsp_handle_announce(c, cseq, buf, hdr_len + content_len);
+    
+        // announce handler re-arms the read event itself
+        return;
     }
     else if (strcmp(method, "RECORD") == 0) {
         ngx_rtsp_handle_record(c, cseq, rs);
+        return;
     }
-    else {
-        ngx_rtsp_send_simple_response(c, cseq, 501,
-                                      "Not Implemented", NULL);
-    }
-
-    /* close only on TEARDOWN */
-    if (strcmp(method, "TEARDOWN") == 0) {
+    else if (strcmp(method, "TEARDOWN") == 0) {
         ngx_rtsp_send_simple_response(c, cseq, 200, "OK", NULL);
         ngx_close_connection(c);
         return;
     }
     else {
-        /* re-arm the read event for the next request */
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            ngx_close_connection(c);
-        }
+        ngx_rtsp_send_simple_response(c, cseq, 501, "Not Implemented", NULL);
+    }
+
+    /* re-arm for next request */
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_close_connection(c);
     }
 }
 
