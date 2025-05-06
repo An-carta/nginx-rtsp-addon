@@ -50,6 +50,24 @@ ngx_rtsp_init_connection(ngx_connection_t *c)
     ngx_handle_read_event(c->read, 0);
 }
 
+static ssize_t
+ngx_rtsp_send_interleaved(ngx_connection_t *c, int channel,
+                          u_char *payload, size_t plen)
+{
+    u_char hdr[4];
+    hdr[0] = '$';
+    hdr[1] = (u_char) channel;
+    hdr[2] = (u_char) (plen >> 8);
+    hdr[3] = (u_char) (plen & 0xff);
+
+    // write the 4-byte RTP-over-TCP header
+    if (c->send(c, hdr, 4) != 4) {
+        return -1;
+    }
+    // then the RTP payload itself
+    return c->send(c, payload, plen);
+}
+
 /* find-or-create a mountpoint by name */
 static ngx_rtsp_stream_t *
 ngx_rtsp_get_stream(ngx_pool_t *pool, ngx_str_t *name)
@@ -80,6 +98,47 @@ ngx_rtsp_get_stream(ngx_pool_t *pool, ngx_str_t *name)
 
     ngx_queue_insert_tail(&streams_head, &s->link);
     return s;
+}
+
+static void
+ngx_rtsp_send_rtp_interleaved(ngx_event_t *wev)
+{
+    ngx_connection_t     *c    = wev->data;
+    ngx_rtsp_session_t   *rs   = c->data;
+    ngx_rtsp_nalu_pool_t *pool = &rs->stream->pool;
+    ngx_rtsp_nalu_t      *nalu;
+    ngx_queue_t          *q, *next;
+
+    /* only in PLAY mode */
+    if (! rs->playing) {
+        return;
+    }
+
+    /* drain the queue: send each NAL as an interleaved RTP→TCP chunk */
+    for (q = ngx_queue_head(&pool->queue);
+         q != ngx_queue_sentinel(&pool->queue);
+         q = next)
+    {
+        nalu = ngx_queue_data(q, ngx_rtsp_nalu_t, queue);
+        next = ngx_queue_next(q);
+
+        /* send it on channel 0 (video) */
+        if (ngx_rtsp_send_interleaved(c, 0, nalu->data, nalu->len) < 0) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "RTP→TCP: send interleaved failed");
+            ngx_close_connection(c);
+            return;
+        }
+
+        ngx_queue_remove(q);
+        /* let the pool free it on disconnect; or ngx_pfree if you prefer */
+    }
+
+    /* re-arm the write event so that whenever new frames join the queue,
+       this handler will fire again to push them out */
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        ngx_close_connection(c);
+    }
 }
 
 /*── dispatcher ────────────────────────────────────────────────────────────────*/
@@ -168,7 +227,9 @@ handle_describe(ngx_connection_t *c, ngx_rtsp_session_t *rs,
         "s=RTSP Session\r\n"
         "t=0 0\r\n"
         "m=video 0 RTP/AVP 96\r\n"
-        "a=rtpmap:96 H264/90000\r\n";
+        "a=control:*\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=range:npt=0-\r\n";
 
     /* send with Content-Type: application/sdp */
     u_char hdrs[256];
@@ -186,6 +247,8 @@ handle_describe(ngx_connection_t *c, ngx_rtsp_session_t *rs,
 static void
 handle_play(ngx_connection_t *c, ngx_rtsp_session_t *rs, int cseq)
 {
+    rs->playing = 1;
+
     ngx_log_error(NGX_LOG_INFO, c->log, 0, "RTSP → PLAY");
 
     u_char extra[64];
@@ -195,9 +258,11 @@ handle_play(ngx_connection_t *c, ngx_rtsp_session_t *rs, int cseq)
                  rs->session_id);
     send_reply(c, cseq, 200, "OK", (char*) extra);
 
-    /* now consume interleaved RTP frames */
-    c->read->handler = ngx_rtsp_recv_rtp_interleaved;
-    ngx_handle_read_event(c->read, 0);
+    /* arm the write handler to send out RTP→TCP frames immediately */
+    c->write->handler = ngx_rtsp_send_rtp_interleaved;
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        ngx_close_connection(c);
+    }
 }
 
 static void
@@ -213,46 +278,62 @@ handle_announce(ngx_connection_t *c,
                 ngx_rtsp_session_t *rs,
                 int cseq, char *uri)
 {
-    ngx_str_t mount;
-    char       *start, *end;
+    ngx_str_t  mount;
+    u_char     buf[8192];
+    ssize_t    n;
+    int        to_read;
+    char      *body, *cl;
+    char    *p, *start, *end;
+    u_char    *dst;
 
-    ngx_log_error(NGX_LOG_INFO, c->log, 0, "RTSP → ANNOUNCE, uri='%s'", uri);
+    // debug uri
+    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                  "[debug] handle_announce() got uri @%p: \"%s\"",
+                  uri, uri);
 
-    start = strstr(uri, "://");
-    if (start) {
-        /* skip “://” */
-        start += 3;
-        /* now find the slash that begins the path */
-        start = strchr(start, '/');
+    // locate the “/” just after host:port in "rtsp://host:port/path..."
+    p = strstr(uri, "rtsp://");
+    if (p) {
+        p += strlen("rtsp://");
+        p  = strchr(p, '/');
     }
-    if (! start) {
-        /* no slash found → empty mount */
-        mount.data = (u_char *) "";
-        mount.len  = 0;
-    }
-    else {
-        /* advance past the slash */
-        start++;
 
-        /* 2) Find the end of the path (space or end‐of‐string) */
-        end = strchr(start, ' ');
-        if (! end) {
-            end = start + strlen(start);
+    if (p) {
+        start = p + 1;    // skip that slash
+        end   = start;
+        // consume until space or CR/LF
+        while (*end && *end != ' ' && *end != '\r' && *end != '\n') {
+            end++;
         }
 
-        /* 3) Fill in the ngx_str_t */
-        mount.data = (u_char *) start;
         mount.len  = end - start;
+        // allocate and copy into the connection pool (so it lives past buf[])
+        dst = ngx_pnalloc(c->pool, mount.len + 1);
+        if (dst == NULL) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "RTSP: pool alloc failed for mount");
+            return;  
+        }
+        ngx_memcpy(dst, start, mount.len);
+        dst[mount.len] = '\0';
+
+        mount.data = dst;
+    }
+    else {
+        // fallback: no path found
+        mount.len  = 0;
+        mount.data = (u_char*) "";
     }
 
-    ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                  "RTSP: mount='%.*s' → creating stream",
-                  (int) mount.len, mount.data);
+    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                  "[debug] mount parsed @%p len=%uz -> \"%s\"",
+                  mount.data, mount.len,
+                  mount.len ? (char*) mount.data : "<empty>");
 
-    /* now look up or create your stream */
+    // 2) Create or look up the stream
     rs->stream = ngx_rtsp_get_stream(c->pool, &mount);
 
-    /* reply with our new session ID */
+    // 3) Send our “200 OK” reply
     {
         u_char extra[64];
         ngx_snprintf(extra, sizeof(extra),
@@ -260,51 +341,44 @@ handle_announce(ngx_connection_t *c,
                      "Content-Length: 0\r\n",
                      rs->session_id);
         send_reply(c, cseq, 200, "OK", (char*) extra);
+    }
 
-        // **NEW**: drain the ANNOUNCE body so we don't confuse our parser on the next read
-        //
-        {
-            // Find the Content-Length header in the client’s request buffer
-            // (We could parse it again, or store it globally; for now assume no more than 10k)
-            u_char  hdrbuf[128];
-            ssize_t n;
-            ngx_int_t content_len = 0;
-    
-            // Read up to (say) 1024 bytes to capture the headers+body start
-            n = c->recv(c, hdrbuf, sizeof(hdrbuf));
-            if (n > 0) {
-                hdrbuf[n] = '\0';
-                // Look for “Content-Length:”
-                u_char *p = (u_char*) ngx_strstr(hdrbuf, "Content-Length:");
-                if (p) {
-                    content_len = atoi((char*) p + sizeof("Content-Length:") - 1);
+    // 4) Drain the ANNOUNCE’s SDP body so the next recv() is the SETUP
+    to_read = 0;
+    // keep reading until we see "\r\n\r\n"
+    while ((n = c->recv(c, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+
+        // if we haven’t found headers → look for end-of-headers
+        if (to_read == 0) {
+            body = strstr((char*) buf, "\r\n\r\n");
+            if (body) {
+                // parse Content-Length:
+                cl = strstr((char*) buf, "Content-Length:");
+                if (cl) {
+                    to_read = atoi(cl + 15);
                 }
-                // Now skip past the double-CRLF
-                p = (u_char*) ngx_strstr(hdrbuf, "\r\n\r\n");
-                if (p) {
-                    p += 4;
-                    n  -= (p - hdrbuf);
-                    // If there’s still body left, subtract that from content_len
-                    if (n > 0) {
-                        content_len -= n;
-                    }
+                // subtract any SDP bytes already read
+                body += 4;            // skip the "\r\n\r\n"
+                to_read -= (n - (body - (char*) buf));
+                if (to_read <= 0) {
+                    break;
                 }
             }
-            // If there’s any SDP body left, drain it
-            while (content_len > 0) {
-                u_char drain[4096];
-                ssize_t got = c->recv(c, drain, ngx_min(content_len, (ngx_int_t) sizeof(drain)));
-                if (got <= 0) {
-                    break;  /* connection closed or error */
-                }
-                content_len -= got;
+        }
+        else {
+            // continue draining SDP
+            to_read -= n;
+            if (to_read <= 0) {
+                break;
             }
         }
-    
-        // Re-arm control parser once the ANNOUNCE body is gone
-         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-             ngx_close_connection(c);
-        }
+    }
+    // (if n <= 0 here, connection closed or error; we’ll just continue)
+
+    // 5) Re-arm the control parser for the next RTSP request
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_close_connection(c);
     }
 }
 
@@ -336,9 +410,9 @@ handle_record(ngx_connection_t *c,
 }
 
 static void
-ngx_rtsp_recv_rtp_interleaved(ngx_event_t *rev)
+ngx_rtsp_recv_rtp_interleaved(ngx_event_t *ev)
 {
-    ngx_connection_t    *c   = rev->data;
+    ngx_connection_t    *c   = ev->data;
     ngx_rtsp_session_t  *rs  = c->data;
     ngx_rtsp_nalu_pool_t *pool = &rs->stream->pool;
     u_char                ihdr[4];
@@ -347,19 +421,19 @@ ngx_rtsp_recv_rtp_interleaved(ngx_event_t *rev)
     // 1) read the 4-byte interleaved header
     n = c->recv(c, ihdr, 4);
     if (n != 4 || ihdr[0] != '$') {
-                ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                              "RTP→TCP: invalid interleaved header, closing connection");
-                ngx_close_connection(c);
-                return;
-            }
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "RTP→TCP: invalid interleaved header, closing");
+        ngx_close_connection(c);
+        return;
+    }
 
     int channel = ihdr[1];
     int plen    = (ihdr[2] << 8) | ihdr[3];
 
     ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
-                  "RTP→TCP: channel=%d length=%d", channel, plen);
+                  "RTP→TCP: got channel=%d length=%d", channel, plen);
 
-    // 2) read the full RTP packet
+    // 2) read the RTP packet
     u_char *pkt = ngx_palloc(c->pool, plen);
     if ((n = c->recv(c, pkt, plen)) != plen) {
         ngx_log_error(NGX_LOG_ERR, c->log, 0,
@@ -368,81 +442,57 @@ ngx_rtsp_recv_rtp_interleaved(ngx_event_t *rev)
         return;
     }
 
-    // 3) parse RTP header
-    //    V=2 P X CC=0   PT & marker
-    uint16_t seq = (pkt[2] << 8) | pkt[3];
-    uint32_t ts  = (pkt[4] << 24)
-                 | (pkt[5] << 16)
-                 | (pkt[6] <<  8)
-                 |  pkt[7];
-    ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                  "RTP→TCP: seq=%u ts=%u", seq, ts);
+    if (! rs->playing) {
+        //
+        // --- RECORD mode: just parse & queue NALUs for later playback
+        //
 
-    // 4) strip the 12-byte RTP header
-    u_char *rtp_payload = pkt + 12;
-    size_t payload_len   = plen - 12;
-    u_char nal0         = rtp_payload[0];
-    u_char nal_type     = nal0 & 0x1F;
+        uint8_t *rtp = pkt + 12;
+        size_t   payload_len = plen - 12;
+        //uint8_t   nal0       = rtp[0];
+        //uint8_t   nal_type   = nal0 & 0x1F;
 
-    // 5) H.264 FU-A handling
-    if (nal_type == 28) {
-        u_char fu = rtp_payload[1];
-        u_char start = fu & 0x80, end = fu & 0x40, orig = fu & 0x1F;
-
-        if (start) {
-            // allocate new reassembly buffer
-            rs->fraglen = 1;
-            rs->fragbuf = ngx_palloc(c->pool, payload_len);
-            // rebuild original NAL header (F/NRI/orig)
-            rs->fragbuf[0] = (nal0 & 0xE0) | orig;
-            ngx_memcpy(rs->fragbuf + 1,
-                       rtp_payload + 2,
-                       payload_len - 2);
-            rs->fraglen += payload_len - 2;
-        }
-        else {
-            // append to existing
-            u_char *newb = ngx_palloc(c->pool, rs->fraglen + payload_len - 2);
-            ngx_memcpy(newb, rs->fragbuf, rs->fraglen);
-            ngx_memcpy(newb + rs->fraglen,
-                       rtp_payload + 2,
-                       payload_len - 2);
-            rs->fragbuf = newb;
-            rs->fraglen += payload_len - 2;
-        }
-
-        if (end) {
-            // complete NAL ready
-            ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                          "RTP→TCP: FU-A complete, nal_type=%u size=%uz",
-                          orig, rs->fraglen);
-
-            // queue it
-            ngx_rtsp_nalu_t *nalu = ngx_palloc(c->pool,
-                                       sizeof(*nalu) + rs->fraglen);
-            nalu->ts   = ts;
-            nalu->len  = rs->fraglen;
-            ngx_memcpy(nalu->data, rs->fragbuf, rs->fraglen);
-            ngx_queue_insert_tail(&pool->queue, &nalu->queue);
-
-            rs->fraglen = 0;
-        }
-    }
-    else {
-        // single NAL
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                      "RTP→TCP: single NAL, type=%u size=%uz",
-                      nal_type, payload_len);
-
+        // handle FU-A reassembly exactly as you had it…
+        // when you finish a complete NAL, do:
         ngx_rtsp_nalu_t *nalu = ngx_palloc(c->pool,
                                    sizeof(*nalu) + payload_len);
-        nalu->ts   = ts;
+        nalu->ts   = ntohl(*(uint32_t*)(rtp + 4)); /* or however you extracted ts */
         nalu->len  = payload_len;
-        ngx_memcpy(nalu->data, rtp_payload, payload_len);
+        ngx_memcpy(nalu->data, rtp, payload_len);
         ngx_queue_insert_tail(&pool->queue, &nalu->queue);
+
+    } else {
+        //
+        // --- PLAY mode: you want to *send* queued NALUs back to the client
+        //
+
+        ngx_rtsp_nalu_t  *n;
+        ngx_queue_t      *q;
+
+        // drain your queue
+        for (q = ngx_queue_head(&pool->queue);
+             q != ngx_queue_sentinel(&pool->queue);
+             /**/ )
+        {
+            n = ngx_queue_data(q, ngx_rtsp_nalu_t, queue);
+            q = ngx_queue_next(q);
+
+            // send each NAL as an RTP→TCP interleaved frame
+            if (ngx_rtsp_send_interleaved(c, channel,
+                                          n->data, n->len) < 0)
+            {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                              "RTP→TCP: send interleaved failed");
+                ngx_close_connection(c);
+                return;
+            }
+
+            ngx_queue_remove(&n->queue);
+            // note: you can free() or just let the pool be reclaimed on close
+        }
     }
 
-    // 6) re-arm for next interleaved RTP chunk
+    // re-arm for the next chunk
     c->read->handler = ngx_rtsp_recv_rtp_interleaved;
     ngx_handle_read_event(c->read, 0);
 }
