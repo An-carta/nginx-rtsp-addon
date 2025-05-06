@@ -33,8 +33,8 @@ ngx_module_t ngx_rtsp_module = {
     NULL,                  // Module directives
     NGX_CORE_MODULE,       // Module type
     NULL,                  // init master
-    ngx_rtsp_streams_init_module, // init module
-    NULL,                  // init process
+    NULL, // init module
+    ngx_rtsp_streams_init_module,                  // init process
     NULL,                  // init thread
     NULL,                  // exit thread
     NULL,                  // exit process

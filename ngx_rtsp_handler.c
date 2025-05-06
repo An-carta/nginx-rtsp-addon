@@ -103,27 +103,46 @@ ngx_rtsp_get_stream(ngx_pool_t *pool, ngx_str_t *name)
 static void
 ngx_rtsp_send_rtp_interleaved(ngx_event_t *wev)
 {
-    ngx_connection_t     *c    = wev->data;
-    ngx_rtsp_session_t   *rs   = c->data;
+    ngx_connection_t    *c  = wev->data;
+    ngx_rtsp_session_t  *rs = c->data;
     ngx_rtsp_nalu_pool_t *pool = &rs->stream->pool;
-    ngx_rtsp_nalu_t      *nalu;
-    ngx_queue_t          *q, *next;
+    ngx_rtsp_nalu_t     *nalu;
+    ngx_queue_t         *q, *next;
 
     /* only in PLAY mode */
     if (! rs->playing) {
         return;
     }
 
-    /* drain the queue: send each NAL as an interleaved RTP→TCP chunk */
+    /* --- on first PLAY, send SPS/PPS as Annex-B NALUs --- */
+    if (! rs->stream->sent_spspps) {
+        /* 4-byte start code: 00 00 00 01 */
+        u_char start4[4] = {0,0,0,1};
+        /* SPS */
+        ngx_rtsp_send_interleaved(c, 0, start4, 4);
+        ngx_rtsp_send_interleaved(c, 0,
+                                 rs->stream->sps.data,
+                                 rs->stream->sps.len);
+        /* PPS */
+        ngx_rtsp_send_interleaved(c, 0, start4, 4);
+        ngx_rtsp_send_interleaved(c, 0,
+                                 rs->stream->pps.data,
+                                 rs->stream->pps.len);
+
+        rs->stream->sent_spspps = 1;
+    }
+
+    /* now drain your queued NALUs as before */
     for (q = ngx_queue_head(&pool->queue);
          q != ngx_queue_sentinel(&pool->queue);
          q = next)
     {
-        nalu = ngx_queue_data(q, ngx_rtsp_nalu_t, queue);
         next = ngx_queue_next(q);
+        nalu = ngx_queue_data(q, ngx_rtsp_nalu_t, queue);
 
-        /* send it on channel 0 (video) */
-        if (ngx_rtsp_send_interleaved(c, 0, nalu->data, nalu->len) < 0) {
+        if (ngx_rtsp_send_interleaved(c, 0,
+                                      nalu->data, nalu->len) < 0)
+        {
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
                           "RTP→TCP: send interleaved failed");
             ngx_close_connection(c);
@@ -131,11 +150,9 @@ ngx_rtsp_send_rtp_interleaved(ngx_event_t *wev)
         }
 
         ngx_queue_remove(q);
-        /* let the pool free it on disconnect; or ngx_pfree if you prefer */
     }
 
-    /* re-arm the write event so that whenever new frames join the queue,
-       this handler will fire again to push them out */
+    /* re-arm… */
     if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
         ngx_close_connection(c);
     }
@@ -216,20 +233,54 @@ static void
 handle_describe(ngx_connection_t *c, ngx_rtsp_session_t *rs,
                 int cseq, char *uri)
 {
+    ngx_str_t  mount;
+    char      *p, *start, *end;
+
+    /* parse the “/live/test” path out of the URI */
+    p = strstr(uri, "rtsp://");
+    if (p) {
+        p += strlen("rtsp://");
+        p  = strchr(p, '/');
+    }
+    if (p) {
+        start    = p + 1;
+        end      = start;
+        while (*end && *end != ' ' && *end != '\r' && *end != '\n') {
+            end++;
+        }
+        mount.len  = end - start;
+        mount.data = (u_char*) start;
+    } else {
+        mount.len  = 0;
+        mount.data = (u_char*) "";
+    }
+
+    /* now that we know the mount, fetch the stream struct */
+    rs->stream = ngx_rtsp_get_stream(c->pool, &mount);
+
     ngx_log_error(NGX_LOG_INFO, c->log, 0,
                   "RTSP → DESCRIBE, uri='%s'", uri);
 
-    /* TODO: parse mountpoint from URI and locate stream */
-    /* TODO: build SDP payload based on stream parameters */
-    const char *sdp =
-        "v=0\r\n"
-        "o=- 0 0 IN IP4 0.0.0.0\r\n"
-        "s=RTSP Session\r\n"
-        "t=0 0\r\n"
-        "m=video 0 RTP/AVP 96\r\n"
-        "a=control:*\r\n"
-        "a=rtpmap:96 H264/90000\r\n"
-        "a=range:npt=0-\r\n";
+    /* build the fmtp line from our stored sps_b64/pps_b64 */
+    u_char fmtp_line[256];
+    ngx_snprintf(fmtp_line, sizeof(fmtp_line),
+                 "packetization-mode=1;"
+                 " sprop-parameter-sets=%V,%V\r\n",
+                 &rs->stream->sps_b64,
+                 &rs->stream->pps_b64);
+
+    /* assemble full SDP */
+    u_char sdp[512];
+    ngx_snprintf(sdp, sizeof(sdp),
+                 "v=0\r\n"
+                 "o=- 0 0 IN IP4 0.0.0.0\r\n"
+                 "s=RTSP Session\r\n"
+                 "t=0 0\r\n"
+                 "m=video 0 RTP/AVP 96\r\n"
+                 "a=control:*\r\n"
+                 "a=rtpmap:96 H264/90000\r\n"
+                 "a=fmtp:96 %s"
+                 , fmtp_line);
 
     /* send with Content-Type: application/sdp */
     u_char hdrs[256];
@@ -239,8 +290,25 @@ handle_describe(ngx_connection_t *c, ngx_rtsp_session_t *rs,
                  ngx_strlen(sdp));
 
     send_reply(c, cseq, 200, "OK", (char*) hdrs);
-    /* write the SDP body itself */
-    c->send(c, (u_char*) sdp, ngx_strlen(sdp));
+
+
+    /* send the SDP body itself, and log what happened */
+    ssize_t n = c->send(c, (u_char*) sdp, ngx_strlen(sdp));
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+        "DESCRIBE: c->send(sdp) returned %zd (expected %uz)",
+        n, ngx_strlen(sdp));
+
+    if (n != (ssize_t) ngx_strlen(sdp)) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+            "DESCRIBE: body send failed, aborting connection");
+        ngx_close_connection(c);
+        return;
+    }
+
+    /* re-arm the read handler */
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_close_connection(c);
+    }
 }
 
 /* PLAY: confirm and switch to RTP interleaved */
@@ -262,7 +330,11 @@ handle_play(ngx_connection_t *c, ngx_rtsp_session_t *rs, int cseq)
     c->write->handler = ngx_rtsp_send_rtp_interleaved;
     if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
         ngx_close_connection(c);
+        return;
     }
+    
+    /* immediately invoke your write handler once to drain any queued frames */
+    ngx_post_event(c->write, &ngx_posted_events);
 }
 
 static void
@@ -375,6 +447,51 @@ handle_announce(ngx_connection_t *c,
         }
     }
     // (if n <= 0 here, connection closed or error; we’ll just continue)
+
+    /* --- parse sprop-parameter-sets from the SDP in buf[] --- */
+    {
+            ngx_str_t raw = { (size_t)n, buf };
+            u_char  *fmtp = ngx_strnstr(raw.data,
+                                        "sprop-parameter-sets=",
+                                        raw.len);
+            if (fmtp) {
+                fmtp += sizeof("sprop-parameter-sets=") - 1;
+                u_char *eol = ngx_strlchr(fmtp,
+                                          raw.data + raw.len,
+                                          '\r');
+                if (!eol) {
+                    eol = ngx_strlchr(fmtp,
+                                      raw.data + raw.len,
+                                      '\n');
+                }
+                if (eol) {
+                    u_char *comma = ngx_strlchr(fmtp, eol, ',');
+                    if (comma) {
+                        ngx_str_t *dst;
+    
+                        /* SPS-Base64 */
+                        dst = &rs->stream->sps_b64;
+                        dst->len = comma - fmtp;
+                        dst->data = ngx_pnalloc(c->pool, dst->len + 1);
+                        ngx_memcpy(dst->data, fmtp, dst->len);
+                        dst->data[dst->len] = '\0';
+    
+                        /* PPS-Base64 */
+                        dst = &rs->stream->pps_b64;
+                        dst->len = eol - (comma + 1);
+                        dst->data = ngx_pnalloc(c->pool, dst->len + 1);
+                        ngx_memcpy(dst->data, comma + 1, dst->len);
+                        dst->data[dst->len] = '\0';
+    
+                        /* decode to raw */
+                        ngx_decode_base64(&rs->stream->sps,
+                                         &rs->stream->sps_b64);
+                        ngx_decode_base64(&rs->stream->pps,
+                                         &rs->stream->pps_b64);
+                    }
+                }
+            }
+        }
 
     // 5) Re-arm the control parser for the next RTSP request
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
