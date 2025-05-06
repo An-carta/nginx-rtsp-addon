@@ -7,6 +7,8 @@ ngx_addon_name=ngx_rtsp_module
 # tell nginx this is a CORE‐level module
 ngx_module_type=CORE
 
+CORE_MODULES="$CORE_MODULES ngx_rtsp_module"
+
 # list of C sources to compile into the nginx binary
 NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
                 $ngx_addon_dir/ngx_rtsp_module.c \
