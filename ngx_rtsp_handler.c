@@ -54,18 +54,23 @@ static ssize_t
 ngx_rtsp_send_interleaved(ngx_connection_t *c, int channel,
                           u_char *payload, size_t plen)
 {
-    u_char hdr[4];
-    hdr[0] = '$';
-    hdr[1] = (u_char) channel;
-    hdr[2] = (u_char) (plen >> 8);
-    hdr[3] = (u_char) (plen & 0xff);
+    u_char hdr[4] = { '$', (u_char)channel,
+                      (u_char)(plen>>8), (u_char)(plen & 0xff) };
+    ssize_t n;
 
-    // write the 4-byte RTP-over-TCP header
-    if (c->send(c, hdr, 4) != 4) {
+    n = c->send(c, hdr, 4);
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        "INTERLEAVED: sent header channel=%d plen=%uz -> ret=%zd",
+        channel, plen, n);
+    if (n != 4) {
         return -1;
     }
-    // then the RTP payload itself
-    return c->send(c, payload, plen);
+
+    n = c->send(c, payload, plen);
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        "INTERLEAVED: sent payload channel=%d len=%uz -> ret=%zd",
+        channel, plen, n);
+    return n == (ssize_t) plen ? plen : (size_t) -1;
 }
 
 /* find-or-create a mountpoint by name */
@@ -103,36 +108,33 @@ ngx_rtsp_get_stream(ngx_pool_t *pool, ngx_str_t *name)
 static void
 ngx_rtsp_send_rtp_interleaved(ngx_event_t *wev)
 {
-    ngx_connection_t    *c  = wev->data;
-    ngx_rtsp_session_t  *rs = c->data;
+    ngx_connection_t    *c   = wev->data;
+    ngx_rtsp_session_t  *rs  = c->data;
     ngx_rtsp_nalu_pool_t *pool = &rs->stream->pool;
     ngx_rtsp_nalu_t     *nalu;
     ngx_queue_t         *q, *next;
 
-    /* only in PLAY mode */
     if (! rs->playing) {
         return;
     }
 
-    /* --- on first PLAY, send SPS/PPS as Annex-B NALUs --- */
+    // first PLAY => inject SPS/PPS with 0x00000001 start codes
     if (! rs->stream->sent_spspps) {
-        /* 4-byte start code: 00 00 00 01 */
-        u_char start4[4] = {0,0,0,1};
-        /* SPS */
-        ngx_rtsp_send_interleaved(c, 0, start4, 4);
+        static const u_char sc[4] = {0,0,0,1};
+        // SPS
+        ngx_rtsp_send_interleaved(c, 0, (u_char*)sc, 4);
         ngx_rtsp_send_interleaved(c, 0,
                                  rs->stream->sps.data,
                                  rs->stream->sps.len);
-        /* PPS */
-        ngx_rtsp_send_interleaved(c, 0, start4, 4);
+        // PPS
+        ngx_rtsp_send_interleaved(c, 0, (u_char*)sc, 4);
         ngx_rtsp_send_interleaved(c, 0,
                                  rs->stream->pps.data,
                                  rs->stream->pps.len);
-
         rs->stream->sent_spspps = 1;
     }
 
-    /* now drain your queued NALUs as before */
+    // then drain queued NALUs
     for (q = ngx_queue_head(&pool->queue);
          q != ngx_queue_sentinel(&pool->queue);
          q = next)
@@ -152,11 +154,12 @@ ngx_rtsp_send_rtp_interleaved(ngx_event_t *wev)
         ngx_queue_remove(q);
     }
 
-    /* re-arm… */
+    // keep write handler armed
     if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
         ngx_close_connection(c);
     }
 }
+
 
 /*── dispatcher ────────────────────────────────────────────────────────────────*/
 static void
@@ -233,43 +236,38 @@ static void
 handle_describe(ngx_connection_t *c, ngx_rtsp_session_t *rs,
                 int cseq, char *uri)
 {
-    ngx_str_t  mount;
-    char      *p, *start, *end;
-
-    /* parse the “/live/test” path out of the URI */
-    p = strstr(uri, "rtsp://");
+    ngx_str_t mount;
+    // parse mount exactly as in announce…
+    char *p = strstr(uri, "rtsp://");
     if (p) {
         p += strlen("rtsp://");
-        p  = strchr(p, '/');
+        p = strchr(p, '/');
     }
     if (p) {
-        start    = p + 1;
-        end      = start;
-        while (*end && *end != ' ' && *end != '\r' && *end != '\n') {
-            end++;
-        }
-        mount.len  = end - start;
-        mount.data = (u_char*) start;
+        mount.data = (u_char*)(p + 1);
+        mount.len  = strcspn((const char *)mount.data, " \r\n");
     } else {
+        mount.data = (u_char*)"";
         mount.len  = 0;
-        mount.data = (u_char*) "";
     }
-
-    /* now that we know the mount, fetch the stream struct */
     rs->stream = ngx_rtsp_get_stream(c->pool, &mount);
 
     ngx_log_error(NGX_LOG_INFO, c->log, 0,
                   "RTSP → DESCRIBE, uri='%s'", uri);
 
-    /* build the fmtp line from our stored sps_b64/pps_b64 */
-    u_char fmtp_line[256];
-    ngx_snprintf(fmtp_line, sizeof(fmtp_line),
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        "DESCRIBE: advertising fmtp:96 sprop-parameter-sets=%V,%V",
+            &rs->stream->sps_b64, &rs->stream->pps_b64);
+
+    // build fmtp line
+    u_char fmtp[256];
+    ngx_snprintf(fmtp, sizeof(fmtp),
                  "packetization-mode=1;"
-                 " sprop-parameter-sets=%V,%V\r\n",
+                 "sprop-parameter-sets=%V,%V\r\n",
                  &rs->stream->sps_b64,
                  &rs->stream->pps_b64);
 
-    /* assemble full SDP */
+    // assemble SDP
     u_char sdp[512];
     ngx_snprintf(sdp, sizeof(sdp),
                  "v=0\r\n"
@@ -279,33 +277,29 @@ handle_describe(ngx_connection_t *c, ngx_rtsp_session_t *rs,
                  "m=video 0 RTP/AVP 96\r\n"
                  "a=control:*\r\n"
                  "a=rtpmap:96 H264/90000\r\n"
-                 "a=fmtp:96 %s"
-                 , fmtp_line);
+                 "a=fmtp:96 %s", fmtp);
 
-    /* send with Content-Type: application/sdp */
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        "DESCRIBE: full SDP payload length=%uz:\n%.*s",
+            ngx_strlen(sdp), (int) ngx_strlen(sdp), sdp);
+
+    // send headers + SDP
     u_char hdrs[256];
     ngx_snprintf(hdrs, sizeof(hdrs),
                  "Content-Type: application/sdp\r\n"
                  "Content-Length: %uz\r\n",
                  ngx_strlen(sdp));
-
     send_reply(c, cseq, 200, "OK", (char*) hdrs);
 
-
-    /* send the SDP body itself, and log what happened */
-    ssize_t n = c->send(c, (u_char*) sdp, ngx_strlen(sdp));
-    ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
-        "DESCRIBE: c->send(sdp) returned %zd (expected %uz)",
-        n, ngx_strlen(sdp));
-
-    if (n != (ssize_t) ngx_strlen(sdp)) {
+    if (c->send(c, sdp, ngx_strlen(sdp))
+        != (ssize_t)ngx_strlen(sdp))
+    {
         ngx_log_error(NGX_LOG_ERR, c->log, 0,
-            "DESCRIBE: body send failed, aborting connection");
+                      "DESCRIBE: failed to send body");
         ngx_close_connection(c);
         return;
     }
 
-    /* re-arm the read handler */
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         ngx_close_connection(c);
     }
@@ -318,6 +312,20 @@ handle_play(ngx_connection_t *c, ngx_rtsp_session_t *rs, int cseq)
     rs->playing = 1;
 
     ngx_log_error(NGX_LOG_INFO, c->log, 0, "RTSP → PLAY");
+
+    /* count queued NALUs */
+    ngx_queue_t *q;
+    size_t      count = 0;
+    for (q = ngx_queue_head(&rs->stream->pool.queue);
+         q != ngx_queue_sentinel(&rs->stream->pool.queue);
+         q = ngx_queue_next(q))
+    {
+        count++;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        "PLAY: session=%d, queue has %uz NALUs, sent_spspps=%d",
+        rs->session_id, count, rs->stream->sent_spspps);
 
     u_char extra[64];
     ngx_snprintf(extra, sizeof(extra),
@@ -350,62 +358,28 @@ handle_announce(ngx_connection_t *c,
                 ngx_rtsp_session_t *rs,
                 int cseq, char *uri)
 {
-    ngx_str_t  mount;
-    u_char     buf[8192];
-    ssize_t    n;
-    int        to_read;
-    char      *body, *cl;
-    char    *p, *start, *end;
-    u_char    *dst;
+    ngx_str_t    mount;
+    u_char       buf[8192];
+    ssize_t      n;
+    char        *cl_hdr, *body_start;
+    int          content_len = 0;
 
-    // debug uri
-    ngx_log_error(NGX_LOG_WARN, c->log, 0,
-                  "[debug] handle_announce() got uri @%p: \"%s\"",
-                  uri, uri);
-
-    // locate the “/” just after host:port in "rtsp://host:port/path..."
-    p = strstr(uri, "rtsp://");
+    // 1) parse the mount exactly as before…
+    char *p = strstr(uri, "rtsp://");
     if (p) {
         p += strlen("rtsp://");
-        p  = strchr(p, '/');
+        p = strchr(p, '/');
     }
-
     if (p) {
-        start = p + 1;    // skip that slash
-        end   = start;
-        // consume until space or CR/LF
-        while (*end && *end != ' ' && *end != '\r' && *end != '\n') {
-            end++;
-        }
-
-        mount.len  = end - start;
-        // allocate and copy into the connection pool (so it lives past buf[])
-        dst = ngx_pnalloc(c->pool, mount.len + 1);
-        if (dst == NULL) {
-            ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                          "RTSP: pool alloc failed for mount");
-            return;  
-        }
-        ngx_memcpy(dst, start, mount.len);
-        dst[mount.len] = '\0';
-
-        mount.data = dst;
-    }
-    else {
-        // fallback: no path found
+        mount.data = (u_char*)(p + 1);
+        mount.len  = strcspn((const char *)mount.data, " \r\n");
+    } else {
+        mount.data = (u_char*)"";
         mount.len  = 0;
-        mount.data = (u_char*) "";
     }
-
-    ngx_log_error(NGX_LOG_WARN, c->log, 0,
-                  "[debug] mount parsed @%p len=%uz -> \"%s\"",
-                  mount.data, mount.len,
-                  mount.len ? (char*) mount.data : "<empty>");
-
-    // 2) Create or look up the stream
     rs->stream = ngx_rtsp_get_stream(c->pool, &mount);
 
-    // 3) Send our “200 OK” reply
+    // 2) reply OK
     {
         u_char extra[64];
         ngx_snprintf(extra, sizeof(extra),
@@ -415,85 +389,80 @@ handle_announce(ngx_connection_t *c,
         send_reply(c, cseq, 200, "OK", (char*) extra);
     }
 
-    // 4) Drain the ANNOUNCE’s SDP body so the next recv() is the SETUP
-    to_read = 0;
-    // keep reading until we see "\r\n\r\n"
-    while ((n = c->recv(c, buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = '\0';
+    // 3) read headers+start of body
+    n = c->recv(c, buf, sizeof(buf));
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = '\0';
 
-        // if we haven’t found headers → look for end-of-headers
-        if (to_read == 0) {
-            body = strstr((char*) buf, "\r\n\r\n");
-            if (body) {
-                // parse Content-Length:
-                cl = strstr((char*) buf, "Content-Length:");
-                if (cl) {
-                    to_read = atoi(cl + 15);
-                }
-                // subtract any SDP bytes already read
-                body += 4;            // skip the "\r\n\r\n"
-                to_read -= (n - (body - (char*) buf));
-                if (to_read <= 0) {
-                    break;
-                }
-            }
+    // 4) find Content-Length:
+    cl_hdr = strstr((char*)buf, "Content-Length:");
+    if (cl_hdr) {
+        content_len = atoi(cl_hdr + strlen("Content-Length:"));
+    }
+
+    // 5) find start of SDP body (after "\r\n\r\n")
+    body_start = strstr((char*)buf, "\r\n\r\n");
+    if (body_start) {
+        body_start += 4;
+        n -= (body_start - (char*)buf);
+    } else {
+        body_start = (char*)buf + n;
+        n = 0;
+    }
+
+    // 6) if we haven’t yet read all SDP, read the rest
+    if (content_len > n) {
+        ssize_t m = c->recv(c,
+            (u_char*)(body_start + n),
+            content_len - n);
+        if (m > 0) {
+            n += m;
         }
-        else {
-            // continue draining SDP
-            to_read -= n;
-            if (to_read <= 0) {
-                break;
+    }
+    // now `body_start[0..content_len-1]` is exactly the SDP
+
+    // 7) extract sprop-parameter-sets
+    {
+        char *fmtp = strstr(body_start, "sprop-parameter-sets=");
+        if (fmtp) {
+            fmtp += strlen("sprop-parameter-sets=");
+            char *comma = strchr(fmtp, ',');
+            char *eol   = strpbrk(fmtp, "\r\n");
+            if (comma && eol && comma < eol) {
+                size_t sps_b64_len = comma - fmtp;
+                size_t pps_b64_len = eol - (comma + 1);
+
+                // copy SPS b64
+                rs->stream->sps_b64.len = sps_b64_len;
+                rs->stream->sps_b64.data = ngx_pnalloc(c->pool, sps_b64_len + 1);
+                ngx_memcpy(rs->stream->sps_b64.data, fmtp, sps_b64_len);
+                rs->stream->sps_b64.data[sps_b64_len] = '\0';
+
+                // copy PPS b64
+                rs->stream->pps_b64.len = pps_b64_len;
+                rs->stream->pps_b64.data = ngx_pnalloc(c->pool, pps_b64_len + 1);
+                ngx_memcpy(rs->stream->pps_b64.data,
+                           comma + 1, pps_b64_len);
+                rs->stream->pps_b64.data[pps_b64_len] = '\0';
+
+                // decode them
+                ngx_decode_base64(&rs->stream->sps,
+                                 &rs->stream->sps_b64);
+                ngx_decode_base64(&rs->stream->pps,
+                                 &rs->stream->pps_b64);
             }
         }
     }
-    // (if n <= 0 here, connection closed or error; we’ll just continue)
 
-    /* --- parse sprop-parameter-sets from the SDP in buf[] --- */
-    {
-            ngx_str_t raw = { (size_t)n, buf };
-            u_char  *fmtp = ngx_strnstr(raw.data,
-                                        "sprop-parameter-sets=",
-                                        raw.len);
-            if (fmtp) {
-                fmtp += sizeof("sprop-parameter-sets=") - 1;
-                u_char *eol = ngx_strlchr(fmtp,
-                                          raw.data + raw.len,
-                                          '\r');
-                if (!eol) {
-                    eol = ngx_strlchr(fmtp,
-                                      raw.data + raw.len,
-                                      '\n');
-                }
-                if (eol) {
-                    u_char *comma = ngx_strlchr(fmtp, eol, ',');
-                    if (comma) {
-                        ngx_str_t *dst;
-    
-                        /* SPS-Base64 */
-                        dst = &rs->stream->sps_b64;
-                        dst->len = comma - fmtp;
-                        dst->data = ngx_pnalloc(c->pool, dst->len + 1);
-                        ngx_memcpy(dst->data, fmtp, dst->len);
-                        dst->data[dst->len] = '\0';
-    
-                        /* PPS-Base64 */
-                        dst = &rs->stream->pps_b64;
-                        dst->len = eol - (comma + 1);
-                        dst->data = ngx_pnalloc(c->pool, dst->len + 1);
-                        ngx_memcpy(dst->data, comma + 1, dst->len);
-                        dst->data[dst->len] = '\0';
-    
-                        /* decode to raw */
-                        ngx_decode_base64(&rs->stream->sps,
-                                         &rs->stream->sps_b64);
-                        ngx_decode_base64(&rs->stream->pps,
-                                         &rs->stream->pps_b64);
-                    }
-                }
-            }
-        }
+    /* --- after decoding sps_b64/pps_b64 and raw sps/pps --- */
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+        "ANNOUNCE: got sps_b64=%V (raw %uz bytes), pps_b64=%V (raw %uz bytes)",
+        &rs->stream->sps_b64, rs->stream->sps.len,
+        &rs->stream->pps_b64, rs->stream->pps.len);
 
-    // 5) Re-arm the control parser for the next RTSP request
+    // 8) re-arm for the next RTSP request
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         ngx_close_connection(c);
     }
